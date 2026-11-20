@@ -34,6 +34,10 @@
 </div>
 
 
+## Rust migration
+
+The [Rust staging bot and Koyeb runbook](rust-bot/README.md) let you test indexed MongoDB search with a separate Telegram bot. The Python deployment remains the production implementation.
+
 ## ✨ Features
 
 - ✅ Auto Filter  
