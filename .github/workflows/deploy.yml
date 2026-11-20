@@ -1,0 +1,94 @@
+name: Build and deploy Rust staging
+
+on:
+  push:
+    paths:
+      - 'rust-bot/**'
+      - '.github/workflows/deploy.yml'
+  pull_request:
+    paths:
+      - 'rust-bot/**'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.image.outputs.name }}
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - id: image
+        env:
+          REPO: ${{ github.repository }}
+        run: echo "name=ghcr.io/${REPO,,}-rust" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref_name == vars.RUST_STAGING_BRANCH)
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        id: build
+        with:
+          context: ./rust-bot
+          platforms: linux/amd64
+          push: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref_name == vars.RUST_STAGING_BRANCH) }}
+          tags: ${{ steps.image.outputs.name }}:${{ github.sha }}
+          cache-from: type=gha,scope=shobana-rust
+          cache-to: type=gha,mode=max,scope=shobana-rust
+
+  deploy-staging:
+    if: ${{ vars.RUST_STAGING_BRANCH != '' && github.ref_type == 'branch' && github.ref_name == vars.RUST_STAGING_BRANCH && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: rust-staging
+    concurrency:
+      group: koyeb-rust-staging
+      cancel-in-progress: false
+    steps:
+      - name: Install Koyeb CLI
+        env:
+          VERSION: '5.12.0'
+          SHA256: c39ce972e48c641368d4c09e98fbe6f3b7ae210687db2ed1de706299b7a8534a
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          archive="koyeb-cli_${VERSION}_linux_amd64.tar.gz"
+          release="https://github.com/koyeb/koyeb-cli/releases/download/v${VERSION}"
+          curl -fsSLO "$release/$archive"
+          printf '%s  %s\n' "$SHA256" "$archive" | sha256sum --strict --check
+          mkdir -p "$RUNNER_TEMP/koyeb-bin"
+          tar xzf "$archive" -C "$RUNNER_TEMP/koyeb-bin" koyeb
+          echo "$RUNNER_TEMP/koyeb-bin" >> "$GITHUB_PATH"
+      - name: Deploy the published image by digest
+        env:
+          KOYEB_TOKEN: ${{ secrets.KOYEB_TOKEN }}
+          KOYEB_SERVICE: ${{ vars.KOYEB_SERVICE }}
+          REGISTRY_SECRET: ${{ vars.KOYEB_REGISTRY_SECRET }}
+          IMAGE: ${{ needs.build.outputs.image }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          : "${KOYEB_TOKEN:?configure KOYEB_TOKEN in the rust-staging environment}"
+          [[ "$KOYEB_SERVICE" =~ ^[a-z0-9-]+/[a-z0-9-]+$ ]] || { echo 'Set KOYEB_SERVICE to the staging app/service'; exit 1; }
+          [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          args=(--docker "$IMAGE@$DIGEST" --wait)
+          if [[ -n "$REGISTRY_SECRET" ]]; then
+            args+=(--docker-private-registry-secret "$REGISTRY_SECRET")
+          fi
+          koyeb service update "$KOYEB_SERVICE" "${args[@]}"

@@ -1,0 +1,24 @@
+[package]
+name = "shobana-rust"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+default-run = "shobana-rust"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+base64 = "0.22"
+futures-util = "0.3"
+grammers-client = "=0.8.0"
+grammers-mtsender = "=0.8.0"
+grammers-session = "=0.8.0"
+mongodb = "~3.10.2"
+rpassword = "7"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
+
+[profile.release]
+strip = true
+lto = "thin"
+panic = "abort"
