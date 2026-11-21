@@ -1,4 +1,4 @@
-# Rust staging migration
+# Rust staging migration.
 
 This is an **admin-only, read-only staging bot**, not a drop-in replacement. The root Python `Dockerfile`, bot, and deployment files are unchanged. The Rust bot uses grammers for Telegram, MongoDB `$text` for catalog search, and Axum on `0.0.0.0:$PORT` for Koyeb health checks. It does not send files, write catalog entries, or implement the Python bot's group filters, force-subscribe rules, stored users/settings, or PostgreSQL/SQLite backends.
 
