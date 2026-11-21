@@ -9,7 +9,7 @@ Use the buttons below to browse all features and commands.
 Each help page contains a short list for easy reading.
 """
     HELP_PAGES = [
-"""<b>📘 Help (1/6): Core Features</b>
+"""<b>📘 Help (1/5): Core Features</b>
 • Auto filter and manual filter replies
 • IMDB details with poster + metadata
 • Spell-check suggestions for wrong queries
@@ -20,7 +20,7 @@ Each help page contains a short list for easy reading.
 • File auto-delete and protected delivery
 • Multiple force-sub channels support
 • Inline search and share support""",
-"""<b>📘 Help (2/6): Public Commands</b>
+"""<b>📘 Help (2/5): Public Commands</b>
 • /start - Start the bot
 • /movies - Latest added movies
 • /series - Latest added series
@@ -31,31 +31,12 @@ Each help page contains a short list for easy reading.
 • /filter or /add - Create manual filter
 • /filters or /viewfilters - List filters
 • /del and /delall - Delete filters""",
-"""<b>📘 Help (3/6): Utility Commands</b>
+"""<b>📘 Help (3/5): Utility Commands</b>
 • /imdb and /mnsearch - Search movie info
 • /id - Show user/chat id
 • /info - Show user information
-• /bug /bugs /feedback - Send feedback
-• /search - Search from external sources
-• /paste /pasty /tgpaste - Create paste link
-• /short - Shorten URL
-• /tr - Translate replied text
-• /font - Style your text
-• /genpassword or /genpw - Generate password""",
-"""<b>📘 Help (4/6): Media/Extra Commands</b>
-• /tts - Text to speech
-• /carbon - Generate carbon image
-• /stickerid - Get sticker file id
-• /json /js /showjson - Message JSON
-• /img /cup /telegraph - Image to link
-• /share /share_text /sharetext - Share text
-• /echo - Repeat text
-• /pin - Pin replied message
-• /unpin - Unpin a message
-• /unpin_all - Unpin all messages""",
-"""<b>📘 Help (5/6): Group/Admin Commands</b>
-• /promote - Promote user in group
-• /demote - Demote user in group
+• /search - Search from external sources""",
+"""<b>📘 Help (4/5): Group/Admin Commands</b>
 • /stats - Show database bot stats
 • /invite - Generate group invite link
 • /ban - Ban a user from bot
@@ -65,7 +46,7 @@ Each help page contains a short list for easy reading.
 • /enable - Enable a chat
 • /deletefiles & /deleteall - Bulk file delete
 • Channel send mode + auto-delete file delivery""",
-"""<b>📘 Help (6/6): Owner/Admin-Only</b>
+"""<b>📘 Help (5/5): Owner/Admin-Only</b>
 • /users - List bot users
 • /chats - List connected chats
 • /channel - List indexed channels
@@ -81,7 +62,7 @@ Each help page contains a short list for easy reading.
     ]
     ABOUT_TXT = """<b>
 ◎ Cʀᴇᴀᴛᴏʀ: <a href=https://github.com/mntgxo> MN - TG</a>
-◎ Lᴀɴɢᴜᴀɢᴇ: Pʏᴛʜᴏɴ 3
+◎ Lᴀɴɢᴜᴀɢᴇ: Pʏᴛʜᴏɴ + Rᴜꜱᴛ
 ◎ Dᴀᴛᴀ Bᴀsᴇ: Mᴏɴɢᴏ DB
 ◎ Bᴏᴛ Sᴇʀᴠᴇʀ: KoYeb</b>"""
     SOURCE_TXT = """<b>NOTE:</b>

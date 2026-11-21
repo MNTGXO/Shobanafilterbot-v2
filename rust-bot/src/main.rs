@@ -1,225 +1,264 @@
-#![allow(deprecated)] // grammers 0.8 TlSession provides portable session bytes.
-
-mod search;
-mod title;
-
-use anyhow::{Context, Result, anyhow, bail, ensure};
-use axum::{Router, routing::get};
-use base64::{Engine as _, engine::general_purpose::STANDARD};
-use grammers_client::{
-    Client, Update, UpdatesConfiguration,
-    types::{Media, Message, Peer},
+use anyhow::{Context, Result, anyhow, ensure};
+use futures_util::{TryStreamExt, future::try_join_all};
+use mongodb::{
+    Client, Collection,
+    bson::{self, Bson, Document, doc},
+    options::ClientOptions,
 };
-use grammers_mtsender::SenderPool;
-use grammers_session::{defs::PeerKind, storages::TlSession};
-use search::Catalog;
-use shobana_rust::config::{Config, channel_key};
-use std::{env, fmt::Write as _, sync::Arc, time::Duration};
-use title::title_phrase;
-use tokio::{net::TcpListener, time::timeout};
+use serde::Deserialize;
+use std::{
+    io::{self, Read, Write},
+    time::Duration,
+};
 
-const INDEX_SAMPLE: usize = 100;
+const MAX_FRAME: usize = 4 * 1024 * 1024;
+const MAX_OFFSET: i64 = 2_500;
+const MAX_PAGE: i64 = 100;
+const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[derive(Deserialize)]
+struct Settings {
+    shards: Vec<Shard>,
+    collection: String,
+}
+
+#[derive(Deserialize)]
+struct Shard {
+    uri: String,
+    database: String,
+}
+
+#[derive(Deserialize)]
+struct Search {
+    filter: Document,
+    offset: i64,
+    limit: i64,
+    fast: bool,
+}
 
 #[tokio::main(worker_threads = 2)]
 async fn main() -> Result<()> {
-    let config = Config::load()?;
-    let listener = TcpListener::bind(("0.0.0.0", config.port)).await?;
-    let catalog = timeout(Duration::from_secs(30), Catalog::connect(&config))
-        .await
-        .context("MongoDB startup timed out")??;
-
-    let pool = SenderPool::new(Arc::new(TlSession::new()), config.api_id);
-    let bot = Client::new(&pool);
-    let SenderPool {
-        runner,
-        updates,
-        handle,
-    } = pool;
-    let mut bot_runner = tokio::spawn(runner.run());
-    timeout(
-        Duration::from_secs(25),
-        bot.bot_sign_in(&config.bot_token, &config.api_hash),
-    )
-    .await
-    .context("Telegram bot login timed out")?
-    .map_err(|_| anyhow!("Telegram bot login failed; check BOT_TOKEN, API_ID and API_HASH"))?;
-    let indexer = load_indexer(config.api_id, !config.channels.is_empty()).await?;
-    let username = timeout(Duration::from_secs(10), bot.get_me())
-        .await
-        .context("Telegram bot identity check timed out")?
-        .map_err(|_| anyhow!("could not read the Telegram bot identity"))?
-        .username()
-        .map(str::to_owned);
-    let mut updates = bot.stream_updates(
-        updates,
-        UpdatesConfiguration {
-            catch_up: false,
-            ..Default::default()
-        },
-    );
-    let app = Router::new()
-        .route("/", get(|| async { "Shobana Rust staging\n" }))
-        .route("/healthz", get(|| async { "ok\n" }));
-
-    eprintln!("Read-only staging bot ready on port {}", config.port);
-    let result = tokio::select! {
-        result = axum::serve(listener, app) => result.context("health server stopped"),
-        _ = &mut bot_runner => Err(anyhow!("Telegram connection runner stopped")),
-        signal = shutdown_signal() => signal,
-        result = async {
-            loop {
-                let update = updates.next().await?;
-                if let Update::NewMessage(message) = update {
-                    // Process one bounded request at a time instead of accumulating tasks.
-                    if timeout(Duration::from_secs(22), handle_message(&message, &config, &catalog, indexer.as_ref(), username.as_deref())).await.is_err() {
-                        eprintln!("Staging command timed out");
-                    }
-                }
-            }
-            #[allow(unreachable_code)]
-            Ok(())
-        } => result,
+    let mut input = io::stdin().lock();
+    let mut output = io::stdout().lock();
+    let Some(frame) = read_frame(&mut input)? else {
+        return Ok(());
     };
-    handle.quit();
-    result
-}
+    // This private pipe is the only configuration channel. Don't print driver errors
+    // along this path; they could include credentials or query content.
+    let settings: Settings =
+        bson::from_slice(&frame).map_err(|_| anyhow!("invalid worker configuration"))?;
+    let collections = open_catalog(settings)
+        .await
+        .map_err(|_| anyhow!("catalog initialization failed"))?;
+    write_frame(&mut output, &doc! { "ok": true })?;
 
-async fn shutdown_signal() -> Result<()> {
-    #[cfg(unix)]
-    {
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        tokio::select! {
-            signal = tokio::signal::ctrl_c() => signal?,
-            _ = sigterm.recv() => {},
-        }
+    while let Some(frame) = read_frame(&mut input)? {
+        let response = match bson::from_slice::<Search>(&frame) {
+            Ok(search) => run_search(&collections, search).await,
+            Err(_) => Err(anyhow!("invalid search request")),
+        };
+        let doc = response.unwrap_or_else(|_| doc! { "ok": false });
+        write_frame(&mut output, &doc)?;
     }
-    #[cfg(not(unix))]
-    tokio::signal::ctrl_c().await?;
     Ok(())
 }
 
-async fn load_indexer(api_id: i32, has_channels: bool) -> Result<Option<Client>> {
-    let encoded = match env::var("GRAMMERS_SESSION_B64") {
-        Ok(encoded) if !encoded.trim().is_empty() => encoded,
-        Ok(_) | Err(env::VarError::NotPresent) => return Ok(None),
-        Err(_) => bail!("GRAMMERS_SESSION_B64 is not valid text"),
-    };
+async fn open_catalog(settings: Settings) -> Result<Vec<Collection<Document>>> {
     ensure!(
-        has_channels,
-        "set CHANNELS to allow an /index preview when supplying a user session"
+        (1..=5).contains(&settings.shards.len()),
+        "expected one to five shards"
     );
-    let decoded = STANDARD
-        .decode(encoded.trim())
-        .context("GRAMMERS_SESSION_B64 is not valid base64")?;
-    let session = TlSession::load(&decoded).map_err(|_| {
-        anyhow!("invalid grammers session; regenerate it with the local session tool")
-    })?;
-    let pool = SenderPool::new(Arc::new(session), api_id);
-    let client = Client::new(&pool);
-    tokio::spawn(pool.runner.run());
-    let user = timeout(Duration::from_secs(15), client.get_me())
-        .await
-        .context("Telegram user session check timed out")?
-        .map_err(|_| anyhow!("could not authorize the grammers user session"))?;
-    ensure!(
-        !user.is_bot(),
-        "GRAMMERS_SESSION_B64 must be a user session"
-    );
-    Ok(Some(client))
+    let mut collections = Vec::new();
+    for shard in settings.shards {
+        let mut opts = ClientOptions::parse(&shard.uri).await?;
+        opts.server_selection_timeout = Some(QUERY_TIMEOUT);
+        let collection = Client::with_options(opts)?
+            .database(&shard.database)
+            .collection(&settings.collection);
+        collections.push(collection);
+    }
+    Ok(collections)
 }
 
-async fn handle_message(
-    message: &Message,
-    config: &Config,
-    catalog: &Catalog,
-    indexer: Option<&Client>,
-    username: Option<&str>,
-) {
-    // Never expose catalog titles to groups, other private users, or anonymous senders.
-    let peer = message.peer_id();
-    if message.outgoing()
-        || peer.kind() != PeerKind::User
-        || !config.admins.contains(&peer.bot_api_dialog_id())
-    {
-        return;
-    }
-    let text = message.text().trim();
-    let (head, args) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
-    let command = if let Some((command, target)) = head.split_once('@') {
-        if !username.is_some_and(|u| u.eq_ignore_ascii_case(target)) {
-            return;
+async fn run_search(collections: &[Collection<Document>], search: Search) -> Result<Document> {
+    ensure!(
+        (0..=MAX_OFFSET).contains(&search.offset) && (1..=MAX_PAGE).contains(&search.limit),
+        "page out of bounds"
+    );
+    let single = collections.len() == 1;
+    let page_size = search.limit + i64::from(search.fast);
+    let fetch_limit = page_size + if single { 0 } else { search.offset };
+    let search_ref = &search;
+    let parts = try_join_all(collections.iter().map(|col| async move {
+        let docs = async {
+            col.find(search_ref.filter.clone())
+                .sort(doc! { "created_at": -1 })
+                .projection(doc! {
+                    "file_ref": 1, "file_name": 1, "file_size": 1, "file_type": 1,
+                    "mime_type": 1, "caption": 1, "created_at": 1,
+                })
+                .skip(if single { search_ref.offset as u64 } else { 0 })
+                .limit(fetch_limit)
+                .max_time(QUERY_TIMEOUT)
+                .await?
+                .try_collect::<Vec<Document>>()
+                .await
+        };
+        if search_ref.fast {
+            docs.await.map(|docs| (docs, 0))
+        } else {
+            let count = async {
+                col.count_documents(search_ref.filter.clone())
+                    .max_time(QUERY_TIMEOUT)
+                    .await
+            };
+            tokio::try_join!(docs, count)
         }
-        command
+    }))
+    .await?;
+    Ok(make_page(parts, &search, single))
+}
+
+fn make_page(parts: Vec<(Vec<Document>, u64)>, search: &Search, single: bool) -> Document {
+    let mut count = 0;
+    let mut docs = Vec::new();
+    for (part, part_count) in parts {
+        count += part_count;
+        docs.extend(part);
+    }
+    if !single {
+        // Stable ordering keeps the same input shard order for equal timestamps.
+        docs.sort_by(|a, b| timestamp(b).total_cmp(&timestamp(a)));
+    }
+    let mut page: Vec<_> = docs
+        .into_iter()
+        .skip(if single { 0 } else { search.offset as usize })
+        .take(search.limit as usize + usize::from(search.fast))
+        .collect();
+    let has_more = if search.fast {
+        let more = page.len() > search.limit as usize;
+        page.truncate(search.limit as usize);
+        count = search.offset as u64 + page.len() as u64 + u64::from(more);
+        more
     } else {
-        head
+        ((search.offset + search.limit) as u64) < count
     };
-    let response = match command {
-        "/start" | "/help" => "Shobana Rust staging (read-only).\n/search <title> lists up to 10 catalog matches.\n/index <channel ID or @username> previews recent documents when a user session is configured.".to_owned(),
-        "/search" => match title_phrase(args) {
-            None => "Usage: /search <title>".to_owned(),
-            Some(phrase) => match timeout(Duration::from_secs(8), catalog.search(&phrase)).await {
-                Ok(Ok(hits)) if hits.is_empty() => "No indexed matches found.".to_owned(),
-                Ok(Ok(hits)) => {
-                    let mut reply = String::from("Catalog matches (read-only):\n");
-                    for (i, hit) in hits.iter().enumerate() {
-                        let name: String = hit.file_name.chars().filter(|c| !c.is_control()).take(150).collect();
-                        let _ = writeln!(reply, "{}. {name}", i + 1);
-                    }
-                    reply
-                }
-                _ => {
-                    eprintln!("Catalog lookup failed");
-                    "Search temporarily unavailable.".to_owned()
-                }
-            },
-        },
-        "/index" => {
-            let target = channel_key(args.trim());
-            if target.is_empty() {
-                "Usage: /index <allowed channel ID or @username>".to_owned()
-            } else if !config.channels.contains(&target) {
-                "That channel is not in the staging CHANNELS list.".to_owned()
-            } else if let Some(client) = indexer {
-                match timeout(Duration::from_secs(15), preview_index(client, &target)).await {
-                    Ok(Ok((scanned, docs))) => format!("Read-only preview: {docs} document messages out of {scanned} recent messages. No records written."),
-                    _ => "Could not read channel history. Check access and CHANNELS.".to_owned(),
-                }
-            } else {
-                "Index preview requires a grammers user session.".to_owned()
-            }
-        }
-        _ => return,
-    };
-    if message.respond(response).await.is_err() {
-        eprintln!("Could not send Telegram staging reply");
+    doc! { "ok": true, "docs": page, "count": count as i64, "has_more": has_more }
+}
+
+fn timestamp(doc: &Document) -> f64 {
+    match doc.get("created_at") {
+        Some(Bson::Double(v)) => *v,
+        Some(Bson::Int32(v)) => f64::from(*v),
+        Some(Bson::Int64(v)) => *v as f64,
+        _ => 0.0,
     }
 }
 
-async fn preview_index(client: &Client, target: &str) -> Result<(usize, usize)> {
-    // Use only channels already visible to the user session; never join chats automatically.
-    let mut dialogs = client.iter_dialogs().limit(500);
-    while let Some(dialog) = dialogs.next().await? {
-        let peer = dialog.peer();
-        if !matches!(peer, Peer::Channel(_)) {
-            continue;
+fn read_frame(input: &mut impl Read) -> Result<Option<Vec<u8>>> {
+    let mut header = [0; 4];
+    loop {
+        match input.read(&mut header[..1]) {
+            Ok(0) => return Ok(None),
+            Ok(_) => break,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
         }
-        if peer.id().bot_api_dialog_id().to_string() != target
-            && !peer
-                .username()
-                .is_some_and(|name| name.eq_ignore_ascii_case(target))
-        {
-            continue;
-        }
-        let mut messages = client.iter_messages(peer).limit(INDEX_SAMPLE);
-        let (mut scanned, mut docs) = (0, 0);
-        while let Some(message) = messages.next().await? {
-            scanned += 1;
-            if matches!(message.media(), Some(Media::Document(_))) {
-                docs += 1;
-            }
-        }
-        return Ok((scanned, docs));
     }
-    bail!("channel not present in user-session dialogs")
+    input.read_exact(&mut header[1..])?;
+    let size = i32::from_le_bytes(header);
+    ensure!(
+        (5..=MAX_FRAME as i32).contains(&size),
+        "invalid frame length"
+    );
+    let mut frame = vec![0; size as usize];
+    frame[..4].copy_from_slice(&header);
+    input
+        .read_exact(&mut frame[4..])
+        .context("incomplete frame")?;
+    Ok(Some(frame))
+}
+
+fn write_frame(output: &mut impl Write, document: &Document) -> Result<()> {
+    let frame = bson::to_vec(document)?;
+    if frame.len() > MAX_FRAME {
+        output.write_all(&bson::to_vec(&doc! {"ok": false})?)?;
+    } else {
+        output.write_all(&frame)?;
+    }
+    output.flush()?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merges_shards_preserving_ties_and_fast_pagination() {
+        let search = Search {
+            filter: doc! {},
+            offset: 1,
+            limit: 2,
+            fast: true,
+        };
+        let output = make_page(
+            vec![
+                (
+                    vec![
+                        doc! { "_id": "first", "created_at": 10.0 },
+                        doc! { "_id": "last", "created_at": 3.0 },
+                    ],
+                    0,
+                ),
+                (
+                    vec![
+                        doc! { "_id": "tie", "created_at": 10 },
+                        doc! { "_id": "middle", "created_at": 5 },
+                    ],
+                    0,
+                ),
+            ],
+            &search,
+            false,
+        );
+        let ids: Vec<_> = output
+            .get_array("docs")
+            .unwrap()
+            .iter()
+            .map(|d| d.as_document().unwrap().get_str("_id").unwrap())
+            .collect();
+        assert_eq!(ids, ["tie", "middle"]);
+        assert_eq!(output.get_i64("count").unwrap(), 4);
+        assert!(output.get_bool("has_more").unwrap());
+    }
+
+    #[test]
+    fn single_shard_keeps_db_offset_and_exact_count() {
+        let search = Search {
+            filter: doc! {},
+            offset: 10,
+            limit: 2,
+            fast: false,
+        };
+        let output = make_page(vec![(vec![doc! {"_id": "last"}], 11)], &search, true);
+        assert_eq!(output.get_array("docs").unwrap().len(), 1);
+        assert_eq!(output.get_i64("count").unwrap(), 11);
+        assert!(!output.get_bool("has_more").unwrap());
+    }
+
+    #[test]
+    fn accepts_bson_frames_and_rejects_invalid_sizes() {
+        let mut buffer = Vec::new();
+        let doc = doc! { "offset": 3_i32, "limit": 10_i32, "fast": true, "filter": { "file_name": Bson::RegularExpression(bson::Regex { pattern: "foo".into(), options: "i".into() }) } };
+        write_frame(&mut buffer, &doc).unwrap();
+        let mut reader = buffer.as_slice();
+        let frame = read_frame(&mut reader).unwrap().unwrap();
+        let query: Search = bson::from_slice(&frame).unwrap();
+        assert_eq!(query.offset, 3);
+        assert_eq!(query.limit, 10);
+        assert_eq!(query.filter, doc.get_document("filter").unwrap().clone());
+        assert!(read_frame(&mut reader).unwrap().is_none());
+        assert!(read_frame(&mut i32::MAX.to_le_bytes().as_slice()).is_err());
+    }
 }

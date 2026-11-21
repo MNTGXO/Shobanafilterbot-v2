@@ -1,6 +1,7 @@
 #  @MrMNTG @MusammilN
 #please give credits https://github.com/MN-BOTS/ShobanaFilterBot
 import logging
+import os
 from struct import pack
 import re
 import base64
@@ -53,6 +54,13 @@ def _finish_search(files, next_offset, total_results, started_at, return_time):
     return files, next_offset, total_results
 
 USE_MONGO = bool(DATABASE_URI)
+_rust_search = None
+
+
+async def close_search_worker():
+    if _rust_search is not None:
+        await _rust_search.close()
+
 
 if not USE_MONGO:
     from database.sql_store import store
@@ -204,6 +212,8 @@ class SQLMediaCollection:
 
 
 if USE_MONGO:
+    from database.rust_search import RustSearchWorker
+
     _mongo_defs = [
         (DATABASE_URI, DATABASE_NAME),
         (DATABASE_URI2, DATABASE_NAME2),
@@ -213,6 +223,7 @@ if USE_MONGO:
     ]
     _seen = set()
     _mongo_collections = []
+    _shards = []
     for uri, db_name in _mongo_defs:
         if not uri:
             continue
@@ -220,12 +231,14 @@ if USE_MONGO:
         if key in _seen:
             continue
         _seen.add(key)
+        _shards.append(key)
         client = AsyncIOMotorClient(key[0])
         _mongo_collections.append(client[key[1]][COLLECTION_NAME])
 
     if not _mongo_collections:
         raise RuntimeError("At least one MongoDB URI is required when DATABASE_URI mode is enabled")
 
+    _rust_search = RustSearchWorker(os.environ.get("RUST_SEARCH_WORKER"), _shards, COLLECTION_NAME)
     MONGO_SHARD_COUNT = len(_mongo_collections)
     logger.info("Media DB shards enabled: %d", MONGO_SHARD_COUNT)
 
@@ -599,6 +612,13 @@ async def get_search_results(
         search_filter = _build_mongo_search_filter(query, file_type=file_type)
     except Exception:
         return _finish_search([], '', 0, started_at, return_time)
+
+    rust_result = await _rust_search.search(search_filter, offset, max_results, fast)
+    if rust_result is not None:
+        docs, next_offset, total_results = rust_result
+        result = ([_as_media_doc(doc) for doc in docs], next_offset, total_results)
+        _cache_set(cache_key, result)
+        return _finish_search(*result, started_at, return_time)
 
     projection = {
         'file_ref': 1,

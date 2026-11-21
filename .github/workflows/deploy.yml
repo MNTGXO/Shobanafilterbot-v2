@@ -1,4 +1,4 @@
-name: Build and deploy Rust staging
+name: Build and deploy Shobana hybrid
 
 on:
   push:
@@ -7,6 +7,10 @@ on:
   pull_request:
     paths:
       - 'rust-bot/**'
+      - '**.py'
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'requirements.txt'
       - '.github/workflows/deploy.yml'
   workflow_dispatch:
 
@@ -46,11 +50,11 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and test Rust image
+      - name: Build and test hybrid bot image
         uses: docker/build-push-action@v6
         id: build
         with:
-          context: ./rust-bot
+          context: .
           platforms: linux/amd64
           push: ${{ steps.image.outputs.publish == 'true' }}
           outputs: ${{ steps.image.outputs.publish == 'false' && 'type=cacheonly' || '' }}
@@ -79,7 +83,7 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           else
             echo 'published=false' >> "$GITHUB_OUTPUT"
-            echo 'Rust image built and tested, but not published. Only runs on `Test` can publish.' >> "$GITHUB_STEP_SUMMARY"
+            echo 'Hybrid image built and tested, but not published. Only runs on `Test` can publish.' >> "$GITHUB_STEP_SUMMARY"
           fi
 
   deploy-staging:

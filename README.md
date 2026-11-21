@@ -34,9 +34,9 @@
 </div>
 
 
-## Rust migration
+## Python + Rust deployment
 
-The [Rust staging bot and Koyeb runbook](rust-bot/README.md) let you test indexed MongoDB search with a separate Telegram bot. The Python deployment remains the production implementation.
+There is one Telegram bot. Python handles Telegram and reads `info.py`; an internal Rust worker handles MongoDB catalog search when available. The [hybrid build and Koyeb runbook](rust-bot/README.md) explains how to deploy both in one image.
 
 ## ✨ Features
 
@@ -52,12 +52,6 @@ The [Rust staging bot and Koyeb runbook](rust-bot/README.md) let you test indexe
 - ✅ Ban, Unban, Enable, Disable Commands  
 - ✅ File Storage  
 - ✅ Auto-Approval for Requests  
-- ✅ Shortener Link Support (`/short`)  
-- ✅ Feedback System  
-- ✅ Font Styling (`/font`)  
-- ✅ User Promotion/Demotion  
-- ✅ Pin/Unpin Messages  
-- ✅ Image-to-Link Conversion
 - ✅ Auto Delete: Automatically removes user messages after processing, so you don't need a separate auto-delete bot
 - ✅ Auto Restart
 - ✅ Keep Alive Function: Prevents the bot from sleeping or shutting down unexpectedly on platforms like Koyeb, eliminating the need for external uptime services like UptimeRobot.
@@ -93,36 +87,7 @@ imdb - Search movie/series info
 mnsearch - Search movie/series info (alias)
 id - Show user / chat ID
 info - Show user information
-bug - Send bug report / feedback
-bugs - Send bug report / feedback (alias)
-feedback - Send feedback (alias)
 search - Search from external sources
-paste - Create paste link
-pasty - Create paste link (alias)
-tgpaste - Create paste link (alias)
-short - Shorten URL
-tr - Translate replied text
-font - Style your text
-genpassword - Generate strong password
-genpw - Generate strong password (alias)
-tts - Text to speech
-carbon - Generate carbon image
-stickerid - Get sticker file ID
-json - Show message JSON
-js - Show message JSON (alias)
-showjson - Show message JSON (alias)
-img - Upload image and get link
-cup - Upload image and get link (alias)
-telegraph - Upload image and get link (alias)
-share - Share text as link
-share_text - Share text as link (alias)
-sharetext - Share text as link (alias)
-echo - Repeat the text
-pin - Pin replied message
-unpin - Unpin a message
-unpin_all - Unpin all messages
-promote - Promote a user in group
-demote - Demote a user in group
 stats - Show bot database statistics
 invite - Generate group invite link
 ban - Ban user from using the bot
