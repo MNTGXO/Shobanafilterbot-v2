@@ -1,3 +1,5 @@
+mod merge;
+
 use anyhow::{Context, Result, anyhow, ensure};
 use futures_util::{TryStreamExt, future::try_join_all};
 use mongodb::{
@@ -120,21 +122,16 @@ async fn run_search(collections: &[Collection<Document>], search: Search) -> Res
 }
 
 fn make_page(parts: Vec<(Vec<Document>, u64)>, search: &Search, single: bool) -> Document {
-    let mut count = 0;
-    let mut docs = Vec::new();
-    for (part, part_count) in parts {
-        count += part_count;
-        docs.extend(part);
-    }
-    if !single {
-        // Stable ordering keeps the same input shard order for equal timestamps.
-        docs.sort_by(|a, b| timestamp(b).total_cmp(&timestamp(a)));
-    }
-    let mut page: Vec<_> = docs
-        .into_iter()
-        .skip(if single { 0 } else { search.offset as usize })
-        .take(search.limit as usize + usize::from(search.fast))
-        .collect();
+    let (parts, counts): (Vec<_>, Vec<_>) = parts.into_iter().unzip();
+    let mut count = counts.into_iter().sum::<u64>();
+    let page_size = search.limit as usize + usize::from(search.fast);
+    let mut page = if single {
+        parts.into_iter().flatten().take(page_size).collect()
+    } else {
+        merge::merge_page(parts, search.offset as usize, page_size, |a, b| {
+            timestamp(b).total_cmp(&timestamp(a))
+        })
+    };
     let has_more = if search.fast {
         let more = page.len() > search.limit as usize;
         page.truncate(search.limit as usize);

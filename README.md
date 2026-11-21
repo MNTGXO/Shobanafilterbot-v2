@@ -34,9 +34,22 @@
 </div>
 
 
-## Python + Rust deployment
+## What's new on `Test`
 
-There is one Telegram bot. Python handles Telegram and reads `info.py`; an internal Rust worker handles MongoDB catalog search when available. The [hybrid build and Koyeb runbook](rust-bot/README.md) explains how to deploy both in one image.
+- **One Python + Rust bot in one Docker image.** Python reads [`info.py`](info.py) and owns the only Telegram session. Telegram commands, permissions, `/index`, and file delivery still run in Python. The private Rust worker runs eligible MongoDB searches, counts results, and merges pages from multiple catalog shards.
+- **Existing settings and search behavior are preserved.** The worker gets the MongoDB catalog configuration from Python. Existing cached searches, the PostgreSQL backend, and requests the worker cannot handle use the Python path. There is no required text index or schema migration, and `RUST_STAGING` and `GRAMMERS_SESSION_B64` are no longer used.
+- **Cleaner build and command list.** The optional `plugins/Extra` commands and unused dependencies such as `yt-dlp` were removed. The image uses Python 3.11 and pinned runtime packages. CI checks the dependency set and tests plugin startup and the Python-to-Rust connection.
+- **Prebuilt images for Koyeb.** A successful push to `Test` publishes the hybrid image to GHCR. Pull request runs build and test only. Koyeb can pull the image without compiling Rust or resolving Python dependencies on the service.
+
+### Is it faster?
+
+The dependency cleanup fixes a **build-time** bottleneck. The runtime also does less work for some requests:
+
+- Identical concurrent catalog searches share one in-flight read. Catalog writes invalidate cached results, and older searches cannot repopulate the cache after a write.
+- Rust can merge the requested page from up to five ordered MongoDB shard results without sorting the full candidate set. Legacy data that isn't consistently ordered still uses the stable sort.
+- PostgreSQL catalog searches and file lookups use a bounded thread pool, so these blocking reads don't hold up Telegram's event loop. File sending, auto-delete, and plugin behavior are unchanged.
+
+These changes don't make MongoDB's regex queries or Telegram network calls faster. There is no measured end-to-end speedup yet. To verify one, compare the same searches on the same catalog and instance size, with the worker enabled and with `RUST_SEARCH_WORKER` empty. Measure cold, cached, and concurrent searches separately; compare median and 95th-percentile response times. Check Koyeb logs to confirm Rust served a search. If uncached queries are still slow, inspect MongoDB query plans before changing search behavior or adding indexes. The [hybrid runbook](rust-bot/README.md) lists the exact log message and rollback setting.
 
 ## ✨ Features
 
@@ -54,8 +67,8 @@ There is one Telegram bot. Python handles Telegram and reads `info.py`; an inter
 - ✅ Auto-Approval for Requests  
 - ✅ Auto Delete: Automatically removes user messages after processing, so you don't need a separate auto-delete bot
 - ✅ Auto Restart
-- ✅ Keep Alive Function: Prevents the bot from sleeping or shutting down unexpectedly on platforms like Koyeb, eliminating the need for external uptime services like UptimeRobot.
-- ✅ /movies and /series Commands: Instantly fetch and display the most recently added movies or series with these commands.
+- ✅ Keep-alive requests to the configured `KEEP_ALIVE_URL`; hosting limits still apply.
+- ✅ `/movies` and `/series` commands list recently added titles.
 - ✅ Hyperlink Mode: When enabled, search results are sent as clickable hyperlinks instead of using callback buttons for easier access.
 - ✅ Multiple Request FSub support: You can add multiple channels. Easily update the required channels with the /fsub command, e.g., /fsub (channel1 id) (channel2 id) (channel3 id).
 - ✅ Delete Files by Query: Use the /deletefiles <keyword> command to delete all files containing a specific word in their name. For example, /deletefiles predvd removes all files with 'predvd' in their filename.
@@ -237,18 +250,14 @@ Important:
 
 ---
 
-### 4) Where to deploy
+### 4) Deploy the published image on Koyeb
 
-- **Koyeb**: easiest for beginners
-- **Render**
-- **Railway**
-- **VPS** (advanced)
+1. Open the latest successful **Build and deploy Shobana hybrid** run for `Test` and copy the path under **GHCR image published**. The package name still ends in `-rust`; use a tag from the hybrid workflow, not an older standalone Rust tag.
+2. In Koyeb, select **Source → Docker** and paste the path into **Image path**. Add a GHCR pull credential if the package is private. Leave command and entrypoint overrides unset.
+3. Keep your existing Python bot environment variables and use one running service per bot token. Expose HTTP port `8000` (or your configured `PORT`) and set the HTTP health check to `/healthz`.
+4. Verify `/start` and a real catalog search in Telegram. With MongoDB, the service logs should show `Rust catalog worker served its first MongoDB search` after an eligible uncached query succeeds.
 
-For all platforms:
-1. Fork repo.
-2. Add env variables.
-3. Deploy.
-4. Verify bot with `/start`.
+The root `Dockerfile` also works for other Docker hosts. See the [hybrid runbook](rust-bot/README.md) for local builds and optional automatic Koyeb updates.
 
 ---
 
