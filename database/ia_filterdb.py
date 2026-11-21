@@ -11,7 +11,9 @@ from pyrogram.file_id import FileId
 from pymongo.errors import DuplicateKeyError, OperationFailure
 from motor.motor_asyncio import AsyncIOMotorClient
 import hashlib
-from collections import OrderedDict, defaultdict
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from database.search_cache import SearchCache
 from sqlalchemy import text
 
 from info import (
@@ -23,28 +25,7 @@ from info import (
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-SEARCH_CACHE_TTL = 30
-SEARCH_CACHE_MAX = 256
-_SEARCH_CACHE = OrderedDict()
-
-
-def _cache_get(key):
-    cached = _SEARCH_CACHE.get(key)
-    if not cached:
-        return None
-    created_at, value = cached
-    if time.monotonic() - created_at > SEARCH_CACHE_TTL:
-        _SEARCH_CACHE.pop(key, None)
-        return None
-    _SEARCH_CACHE.move_to_end(key)
-    return value
-
-
-def _cache_set(key, value):
-    _SEARCH_CACHE[key] = (time.monotonic(), value)
-    _SEARCH_CACHE.move_to_end(key)
-    while len(_SEARCH_CACHE) > SEARCH_CACHE_MAX:
-        _SEARCH_CACHE.popitem(last=False)
+_SEARCH_CACHE = SearchCache()
 
 
 def _finish_search(files, next_offset, total_results, started_at, return_time):
@@ -58,12 +39,20 @@ _rust_search = None
 
 
 async def close_search_worker():
+    await _SEARCH_CACHE.cancel_pending()
     if _rust_search is not None:
         await _rust_search.close()
 
 
 if not USE_MONGO:
     from database.sql_store import store
+
+    # Searches/retrieval use synchronous SQLAlchemy in threads. Keep read
+    # concurrency bounded, leaving pool capacity for indexing and other writes.
+    _sql_read_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="catalog-sql")
+
+    async def _run_sql_read(fn, *args):
+        return await asyncio.get_running_loop().run_in_executor(_sql_read_pool, fn, *args)
 
 
 class SQLMediaDoc(dict):
@@ -192,7 +181,7 @@ class SQLMediaCollection:
         with store.begin() as conn:
             for fid in ids:
                 conn.execute(text("DELETE FROM media WHERE file_id=:fid"), {"fid": fid})
-        _SEARCH_CACHE.clear()
+        _SEARCH_CACHE.invalidate()
         return SQLDeleteResult(len(ids))
 
     async def delete_one(self, query):
@@ -202,13 +191,13 @@ class SQLMediaCollection:
         fid = docs[0]['file_id']
         with store.begin() as conn:
             conn.execute(text("DELETE FROM media WHERE file_id=:fid"), {"fid": fid})
-        _SEARCH_CACHE.clear()
+        _SEARCH_CACHE.invalidate()
         return SQLDeleteResult(1)
 
     async def drop(self):
         with store.begin() as conn:
             conn.execute(text("DELETE FROM media"))
-        _SEARCH_CACHE.clear()
+        _SEARCH_CACHE.invalidate()
 
 
 if USE_MONGO:
@@ -315,7 +304,7 @@ if USE_MONGO:
             results = await asyncio.gather(*[col.delete_many(query) for col in _mongo_collections])
             deleted_count = sum(r.deleted_count for r in results)
             if deleted_count:
-                _SEARCH_CACHE.clear()
+                _SEARCH_CACHE.invalidate()
             return SQLDeleteResult(deleted_count)
 
         async def delete_one(self, query):
@@ -326,12 +315,12 @@ if USE_MONGO:
                 res = await col.delete_one(query)
                 deleted += res.deleted_count
             if deleted:
-                _SEARCH_CACHE.clear()
+                _SEARCH_CACHE.invalidate()
             return SQLDeleteResult(deleted)
 
         async def drop(self):
             await asyncio.gather(*[col.drop() for col in _mongo_collections])
-            _SEARCH_CACHE.clear()
+            _SEARCH_CACHE.invalidate()
 
     class Media:
         collection = MongoMergedCollection()
@@ -419,7 +408,7 @@ async def save_file(media):
         }
         try:
             await _target_collection(file_id).insert_one(doc)
-            _SEARCH_CACHE.clear()
+            _SEARCH_CACHE.invalidate()
         except DuplicateKeyError:
             logger.warning(f'{getattr(media, "file_name", "NO_FILE")} is already saved in database')
             return False, 0
@@ -448,7 +437,7 @@ async def save_file(media):
                 "caption": media.caption.html if media.caption else None,
             },
         )
-    _SEARCH_CACHE.clear()
+    _SEARCH_CACHE.invalidate()
     return True, 1
 
 
@@ -546,79 +535,81 @@ async def get_search_results(
         return _finish_search([], '', 0, started_at, return_time)
 
     cache_key = (query.lower(), file_type, max_results, offset, bool(USE_CAPTION_FILTER), bool(USE_MONGO), fast)
-    cached = _cache_get(cache_key)
-    if cached is not None:
-        files, next_offset, total_results = cached
-        return _finish_search(files, next_offset, total_results, started_at, return_time)
+    result = await _SEARCH_CACHE.get_or_load(
+        cache_key, lambda: _load_search_results(query, file_type, max_results, offset, fast),
+    )
+    return _finish_search(*result, started_at, return_time)
 
-    if not USE_MONGO:
-        terms = [t for t in query.split() if t]
-        where = []
-        params = {"offset": offset, "limit": max_results}
 
-        if file_type:
-            where.append("file_type = :file_type")
-            params["file_type"] = file_type
+def _search_sql(query, file_type, max_results, offset, fast):
+    terms = [t for t in query.split() if t]
+    where = []
+    params = {"offset": offset, "limit": max_results}
 
-        if terms:
-            term_sql = []
-            for idx, term in enumerate(terms):
-                key = f"term_{idx}"
-                params[key] = f"%{term}%"
-                if USE_CAPTION_FILTER:
-                    term_sql.append(f"(file_name ILIKE :{key} OR COALESCE(caption, '') ILIKE :{key})")
-                else:
-                    term_sql.append(f"file_name ILIKE :{key}")
-            where.append(" AND ".join(term_sql))
+    if file_type:
+        where.append("file_type = :file_type")
+        params["file_type"] = file_type
 
-        where_clause = " AND ".join(where) if where else "TRUE"
-
-        with store.begin() as conn:
-            if fast:
-                total_results = None
-                params["limit"] = max_results + 1
+    if terms:
+        term_sql = []
+        for idx, term in enumerate(terms):
+            key = f"term_{idx}"
+            params[key] = f"%{term}%"
+            if USE_CAPTION_FILTER:
+                term_sql.append(f"(file_name ILIKE :{key} OR COALESCE(caption, '') ILIKE :{key})")
             else:
-                total_results = int(conn.execute(text(f"SELECT COUNT(*) FROM media WHERE {where_clause}"), params).scalar() or 0)
-            rows = conn.execute(
-                text(
-                    f"""
-                    SELECT file_id, file_ref, file_name, file_size, file_type, mime_type, caption, created_at
-                    FROM media
-                    WHERE {where_clause}
-                    ORDER BY created_at DESC
-                    OFFSET :offset LIMIT :limit
-                    """
-                ),
-                params,
-            ).fetchall()
+                term_sql.append(f"file_name ILIKE :{key}")
+        where.append(" AND ".join(term_sql))
 
-        files = [_sql_row_to_doc(row) for row in rows]
-        has_more = fast and len(files) > max_results
-        if has_more:
-            files = files[:max_results]
+    where_clause = " AND ".join(where) if where else "TRUE"
 
-        next_offset = offset + max_results
+    with store.begin() as conn:
         if fast:
-            total_results = offset + len(files) + (1 if has_more else 0)
-            if not has_more:
-                next_offset = ''
-        elif next_offset >= total_results:
+            total_results = None
+            params["limit"] = max_results + 1
+        else:
+            total_results = int(conn.execute(text(f"SELECT COUNT(*) FROM media WHERE {where_clause}"), params).scalar() or 0)
+        rows = conn.execute(
+            text(
+                f"""
+                SELECT file_id, file_ref, file_name, file_size, file_type, mime_type, caption, created_at
+                FROM media
+                WHERE {where_clause}
+                ORDER BY created_at DESC
+                OFFSET :offset LIMIT :limit
+                """
+            ),
+            params,
+        ).fetchall()
+
+    files = [_sql_row_to_doc(row) for row in rows]
+    has_more = fast and len(files) > max_results
+    if has_more:
+        files = files[:max_results]
+
+    next_offset = offset + max_results
+    if fast:
+        total_results = offset + len(files) + (1 if has_more else 0)
+        if not has_more:
             next_offset = ''
-        result = (files, next_offset, total_results)
-        _cache_set(cache_key, result)
-        return _finish_search(*result, started_at, return_time)
+    elif next_offset >= total_results:
+        next_offset = ''
+    return files, next_offset, total_results
+
+
+async def _load_search_results(query, file_type, max_results, offset, fast):
+    if not USE_MONGO:
+        return await _run_sql_read(_search_sql, query, file_type, max_results, offset, fast)
 
     try:
         search_filter = _build_mongo_search_filter(query, file_type=file_type)
     except Exception:
-        return _finish_search([], '', 0, started_at, return_time)
+        return [], '', 0
 
     rust_result = await _rust_search.search(search_filter, offset, max_results, fast)
     if rust_result is not None:
         docs, next_offset, total_results = rust_result
-        result = ([_as_media_doc(doc) for doc in docs], next_offset, total_results)
-        _cache_set(cache_key, result)
-        return _finish_search(*result, started_at, return_time)
+        return [_as_media_doc(doc) for doc in docs], next_offset, total_results
 
     projection = {
         'file_ref': 1,
@@ -653,20 +644,17 @@ async def get_search_results(
             if next_offset >= total_results:
                 next_offset = ''
             files = [_as_media_doc(d) for d in docs]
-        result = (files, next_offset, total_results)
-        _cache_set(cache_key, result)
-        return _finish_search(*result, started_at, return_time)
+        return files, next_offset, total_results
 
     fetch_limit = offset + max_results + (1 if fast else 0)
 
     async def _fetch(col):
-        docs = await (
+        return await (
             col.find(search_filter, projection)
             .sort('created_at', -1)
             .limit(fetch_limit)
             .to_list(length=fetch_limit)
         )
-        return [_as_media_doc(d) for d in docs]
 
     fetch_task = asyncio.gather(*[_fetch(col) for col in _mongo_collections])
     if fast:
@@ -677,11 +665,11 @@ async def get_search_results(
         counts, parts = await asyncio.gather(count_task, fetch_task)
         total_results = sum(counts)
 
-    files = [d for part in parts for d in part]
-    files.sort(key=lambda d: d.get('created_at', 0), reverse=True)
-    page_files = files[offset: offset + max_results + (1 if fast else 0)]
+    sorted_docs = sorted((doc for part in parts for doc in part),
+                         key=lambda doc: doc.get('created_at', 0), reverse=True)
+    page_files = sorted_docs[offset:offset + max_results + (1 if fast else 0)]
     has_more = fast and len(page_files) > max_results
-    files = page_files[:max_results]
+    files = [_as_media_doc(doc) for doc in page_files[:max_results]]
 
     next_offset = offset + max_results
     if fast:
@@ -691,22 +679,24 @@ async def get_search_results(
     elif next_offset >= total_results:
         next_offset = ''
 
-    result = (files, next_offset, total_results)
-    _cache_set(cache_key, result)
-    return _finish_search(*result, started_at, return_time)
+    return files, next_offset, total_results
+
+
+def _get_file_details_sql(query):
+    with store.begin() as conn:
+        row = conn.execute(
+            text(
+                "SELECT file_id, file_ref, file_name, file_size, file_type, mime_type, caption, created_at "
+                "FROM media WHERE file_id=:file_id LIMIT 1"
+            ),
+            {"file_id": query},
+        ).first()
+    return [_sql_row_to_doc(row)] if row else []
 
 
 async def get_file_details(query):
     if not USE_MONGO:
-        with store.begin() as conn:
-            row = conn.execute(
-                text(
-                    "SELECT file_id, file_ref, file_name, file_size, file_type, mime_type, caption, created_at "
-                    "FROM media WHERE file_id=:file_id LIMIT 1"
-                ),
-                {"file_id": query},
-            ).first()
-        return [_sql_row_to_doc(row)] if row else []
+        return await _run_sql_read(_get_file_details_sql, query)
 
     search_filter = {'_id': query}
     if MONGO_SHARD_COUNT == 1:
