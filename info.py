@@ -66,6 +66,8 @@ AUTH_GROUPS = [int(ch) for ch in auth_grp.split()] if auth_grp else None
 DATABASE_URI = environ.get('DATABASE_URI', "")
 DATABASE_NAME = environ.get('DATABASE_NAME', "Cluster0")
 COLLECTION_NAME = environ.get('COLLECTION_NAME', 'mn_files')
+MONGO_INDEXED_SEARCH = is_enabled(environ.get('MONGO_INDEXED_SEARCH', 'false'), False)
+MONGO_SEARCH_INDEX = environ.get('MONGO_SEARCH_INDEX', 'media_titles').strip() or 'media_titles'
 DATABASE_URI2 = environ.get('DATABASE_URI2', "")
 DATABASE_URI3 = environ.get('DATABASE_URI3', "")
 DATABASE_URI4 = environ.get('DATABASE_URI4', "")
@@ -83,7 +85,8 @@ FILE_CHANNEL_SENDING_MODE = is_enabled(environ.get('FILE_CHANNEL_SENDING_MODE', 
 FILE_AUTO_DELETE_SECONDS = int(environ.get('FILE_AUTO_DELETE_SECONDS', 60))  # Default: 1 minute
 
 
-# Private search guidance
+# Private search (set false to redirect users to the group instead)
+PM_SEARCH_ENABLED = is_enabled(environ.get('PM_SEARCH_ENABLED', 'True'), True)
 PM_SEARCH_GROUP_LINK = environ.get('PM_SEARCH_GROUP_LINK', 'https://t.me/MnMoviesLinks/4')
 PM_SEARCH_REDIRECT_TEXT = environ.get(
     'PM_SEARCH_REDIRECT_TEXT',

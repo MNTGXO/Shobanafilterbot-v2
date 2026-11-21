@@ -22,6 +22,10 @@ from urllib.parse import quote_plus
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+INDEX_MESSAGE_LINK = re.compile(
+    r"(https://)?(t\.me/|telegram\.me/|telegram\.dog/)(c/)?(\d+|[a-zA-Z_0-9]+)/(\d+)$"
+)
+
 BTN_URL_REGEX = re.compile(
     r"(\[([^\[]+?)\]\((buttonurl|buttonalert):(?:/{0,2})(.+?)(:same)?\))"
 )

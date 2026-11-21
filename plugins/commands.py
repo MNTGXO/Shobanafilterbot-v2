@@ -6,12 +6,12 @@ from Script import script
 from pyrogram import Client, filters, enums
 from pyrogram.errors import ChatAdminRequired, FloodWait
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-from database.ia_filterdb import Media, get_file_details, unpack_new_file_id
+from database.ia_filterdb import Media, get_file_details, normalize_file_id
 from database.users_chats_db import db
 from info import CHANNELS, ADMINS, LOG_CHANNEL, PICS, BATCH_FILE_CAPTION, CUSTOM_FILE_CAPTION, PROTECT_CONTENT, FILE_CHANNELS, FILE_CHANNEL_SENDING_MODE, FILE_AUTO_DELETE_SECONDS
 from utils import get_settings, get_size, is_subscribed, save_group_settings, temp, create_invite_links, get_chat_join_link
 from database.connections_mdb import active_connection
-from plugins.pm_filter import auto_filter
+from plugins.pm_filter import search_in_pm
 import re
 import json
 from pyrogram.types import Message
@@ -226,7 +226,7 @@ async def start(client, message):
         search = searches.replace('-', ' ').replace('_', ' ').strip()
         if search:
             message.text = search
-            await auto_filter(client, message)
+            await search_in_pm(client, message)
         return
 
     if not await is_subscribed(message.from_user.id, client):
@@ -371,7 +371,11 @@ async def start(client, message):
 
     files_ = await get_file_details(file_id)           
     if not files_:
-        pre, file_id = ((base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))).decode("ascii")).split("_", 1)
+        try:
+            decoded = base64.urlsafe_b64decode(data + "=" * (-len(data) % 4)).decode("ascii")
+            pre, file_id = decoded.split("_", 1)
+        except ValueError:
+            return await message.reply('No such file exist.')
         try:
             protect_content_flag = True if pre == 'filep' else False
             
@@ -512,7 +516,7 @@ async def delete(bot, message):
         await msg.edit('This is not supported file format')
         return
     
-    file_id, file_ref = unpack_new_file_id(media.file_id)
+    file_id = normalize_file_id(media.file_id)
 
     result = await Media.collection.delete_one({
         '_id': file_id,

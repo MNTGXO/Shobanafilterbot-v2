@@ -10,4 +10,8 @@ async def bot_run():
 @routes.get("/", allow_head=True)
 async def root_route_handler(request):
     return webserver.json_response(" Web Supported . . . !  This is a preview of WeB . . .! ! !")
- 
+
+
+@routes.get("/healthz")
+async def health(request):
+    return webserver.json_response({"ok": True})
