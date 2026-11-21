@@ -47,9 +47,10 @@ The dependency cleanup fixes a **build-time** bottleneck. The runtime also does 
 
 - Identical concurrent catalog searches share one in-flight read. Catalog writes invalidate cached results, and older searches cannot repopulate the cache after a write.
 - Rust can merge the requested page from up to five ordered MongoDB shard results without sorting the full candidate set. Legacy data that isn't consistently ordered still uses the stable sort.
-- PostgreSQL catalog searches and file lookups use a bounded thread pool, so these blocking reads don't hold up Telegram's event loop. File sending, auto-delete, and plugin behavior are unchanged.
+- PostgreSQL catalog searches and file lookups use a bounded thread pool, so these blocking reads don't hold up Telegram's event loop.
+- File buttons on every group and private search results page use direct Telegram deep links to `/start`, skipping the callback redirect. Next/Back still use callbacks and previously sent file buttons still work. Force-subscribe, protected delivery, and existing auto-delete behavior still apply.
 
-These changes don't make MongoDB's regex queries or Telegram network calls faster. There is no measured end-to-end speedup yet. To verify one, compare the same searches on the same catalog and instance size, with the worker enabled and with `RUST_SEARCH_WORKER` empty. Measure cold, cached, and concurrent searches separately; compare median and 95th-percentile response times. Check Koyeb logs to confirm Rust served a search. If uncached queries are still slow, inspect MongoDB query plans before changing search behavior or adding indexes. The [hybrid runbook](rust-bot/README.md) lists the exact log message and rollback setting.
+These changes don't make MongoDB's regex queries or Telegram network calls faster. There is no measured end-to-end speedup yet. To verify one, compare the same searches on the same catalog and instance size, with the worker enabled and with `RUST_SEARCH_WORKER` empty. Measure cold, cached, and concurrent searches separately; compare median and 95th-percentile response times. Check Koyeb logs to confirm Rust served a search. If uncached queries are still slow, inspect MongoDB query plans before changing search behavior or adding indexes. The [hybrid runbook](rust-bot/README.md) lists the exact log message and rollback setting. For large catalogs, see [what the bot stores in MongoDB and how to opt in to MongoDB Search](database/README.md).
 
 ## ✨ Features
 
@@ -59,7 +60,8 @@ These changes don't make MongoDB's regex queries or Telegram network calls faste
 - ✅ Admin Commands  
 - ✅ Broadcast Messages  
 - ✅ File Indexing  
-- ✅ Inline Search  
+- ✅ Inline Search
+- ✅ Private chat search: send a title directly to the bot. `AUTH_USERS` (if configured) and force-subscribe apply. Set `PM_SEARCH_ENABLED=false` to restore the group redirect configured by `PM_SEARCH_GROUP_LINK` and `PM_SEARCH_REDIRECT_TEXT`.
 - ✅ Random Pics Generator  
 - ✅ User and Chat Stats  
 - ✅ Ban, Unban, Enable, Disable Commands  

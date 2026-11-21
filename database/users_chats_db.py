@@ -4,7 +4,7 @@
 import asyncio
 from datetime import datetime
 
-import motor.motor_asyncio
+from database.mongo_clients import mongo_client
 from sqlalchemy import text
 
 from info import (
@@ -37,7 +37,7 @@ class Database:
     def __init__(self, uri, database_name):
         self.use_mongo = USE_MONGO
         if self.use_mongo:
-            self._client = motor.motor_asyncio.AsyncIOMotorClient(uri)
+            self._client = mongo_client(uri)
             self.db = self._client[database_name]
             self.col = self.db.users
             self.grp = self.db.groups
@@ -63,7 +63,7 @@ class Database:
                 if key in seen:
                     continue
                 seen.add(key)
-                client = self._client if key[0] == uri else motor.motor_asyncio.AsyncIOMotorClient(key[0])
+                client = mongo_client(key[0])
                 self._mongo_dbs.append(client[key[1]])
 
 

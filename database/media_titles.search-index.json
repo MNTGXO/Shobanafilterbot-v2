@@ -1,0 +1,12 @@
+{
+  "analyzer": "lucene.standard",
+  "mappings": {
+    "dynamic": false,
+    "fields": {
+      "file_name": { "type": "string" },
+      "file_type": { "type": "token", "normalizer": "none" },
+      "created_at": { "type": "number" },
+      "_id": { "type": "token", "normalizer": "none" }
+    }
+  }
+}
