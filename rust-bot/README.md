@@ -17,9 +17,13 @@ Publishing does not require Koyeb credentials. For optional automatic updates, r
 - Rust executes MongoDB page and count queries, merges shard results, and returns the existing file metadata and pagination to Python. Search matching, including caption configuration, is unchanged. No new index or schema migration is required. Moving the query handling off Python does **not** make MongoDB regex scans faster by itself; benchmark on your catalog before claiming a throughput gain.
 - The existing Python cache still serves repeat searches. SQL backends, large pages, and concurrent requests while the worker is busy use the existing Python path. If the worker is unavailable, times out, or returns an invalid reply, Python falls back and waits briefly before trying it again.
 
+Install the pinned Python 3.11 dependencies in a fresh virtual environment for local testing. The Docker build checks the installed dependencies and runs a plugin startup smoke test without connecting to Telegram or MongoDB.
+
 ```sh
-cargo test --locked --manifest-path rust-bot/Cargo.toml
+python -m pip install -r requirements.txt
+python -m pip check
 python -m unittest discover -s tests
+cargo test --locked --manifest-path rust-bot/Cargo.toml
 docker build -t shobana-hybrid .
 ```
 
