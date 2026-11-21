@@ -20,7 +20,7 @@ import tgcrypto
 from pyrogram import Client, __version__
 from pyrogram.types import BotCommand
 from pyrogram.raw.all import layer
-from database.ia_filterdb import Media
+from database.ia_filterdb import Media, close_search_worker
 from database.users_chats_db import db
 from info import SESSION, API_ID, API_HASH, BOT_TOKEN, LOG_STR, LOG_CHANNEL, KEEP_ALIVE_URL, DEFAULT_AUTH_CHANNELS
 from utils import temp
@@ -53,7 +53,6 @@ BOT_COMMANDS = [
     BotCommand("filters", "List filters"),
     BotCommand("imdb", "Search movie/series info"),
     BotCommand("mnsearch", "Search movie/series info"),
-    BotCommand("bug", "Send bug report / feedback"),
     BotCommand("search", "Search from external sources"),
     BotCommand("deletefiles", "Bulk delete indexed files"),
     BotCommand("stats", "Show database statistics"),
@@ -139,7 +138,10 @@ class Bot(Client):
         await webserver.TCPSite(client, bind_address, PORT_CODE).start()
 
     async def stop(self, *args):
-        await super().stop()
+        try:
+            await super().stop()
+        finally:
+            await close_search_worker()
         logging.info("Bot stopped. Bye.")
 
     async def iter_messages(
