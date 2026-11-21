@@ -2,9 +2,8 @@ name: Build and deploy Rust staging
 
 on:
   push:
-    paths:
-      - 'rust-bot/**'
-      - '.github/workflows/deploy.yml'
+    branches:
+      - Test
   pull_request:
     paths:
       - 'rust-bot/**'
@@ -28,31 +27,63 @@ jobs:
     outputs:
       image: ${{ steps.image.outputs.name }}
       digest: ${{ steps.build.outputs.digest }}
+      published: ${{ steps.summary.outputs.published }}
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
-      - id: image
+      - name: Set image name and publish policy
+        id: image
         env:
           REPO: ${{ github.repository }}
-        run: echo "name=ghcr.io/${REPO,,}-rust" >> "$GITHUB_OUTPUT"
-      - uses: docker/login-action@v3
-        if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref_name == vars.RUST_STAGING_BRANCH)
+          PUBLISH: ${{ github.ref == 'refs/heads/Test' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+        run: |
+          echo "name=ghcr.io/${REPO,,}-rust" >> "$GITHUB_OUTPUT"
+          echo "publish=$PUBLISH" >> "$GITHUB_OUTPUT"
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        if: steps.image.outputs.publish == 'true'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
+      - name: Build and test Rust image
+        uses: docker/build-push-action@v6
         id: build
         with:
           context: ./rust-bot
           platforms: linux/amd64
-          push: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref_name == vars.RUST_STAGING_BRANCH) }}
+          push: ${{ steps.image.outputs.publish == 'true' }}
+          outputs: ${{ steps.image.outputs.publish == 'false' && 'type=cacheonly' || '' }}
           tags: ${{ steps.image.outputs.name }}:${{ github.sha }}
           cache-from: type=gha,scope=shobana-rust
           cache-to: type=gha,mode=max,scope=shobana-rust
+      - name: Show published image path
+        id: summary
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          PUBLISH: ${{ steps.image.outputs.publish }}
+        run: |
+          set -euo pipefail
+          if [[ "$PUBLISH" == true ]]; then
+            if [[ ! "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+              echo '::error::No valid digest was returned from the registry export.'
+              exit 1
+            fi
+            echo 'published=true' >> "$GITHUB_OUTPUT"
+            {
+              echo '## GHCR image published'
+              echo 'Paste this into Koyeb under **Source → Docker → Image path**:'
+              printf '\n```text\n%s:%s\n```\n' "$IMAGE" "$GITHUB_SHA"
+              printf '\nImmutable image reference: `%s@%s`\n' "$IMAGE" "$DIGEST"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'published=false' >> "$GITHUB_OUTPUT"
+            echo 'Rust image built and tested, but not published. Only runs on `Test` can publish.' >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   deploy-staging:
-    if: ${{ vars.RUST_STAGING_BRANCH != '' && github.ref_type == 'branch' && github.ref_name == vars.RUST_STAGING_BRANCH && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+    if: ${{ needs.build.outputs.published == 'true' && vars.RUST_AUTO_DEPLOY == 'true' }}
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
