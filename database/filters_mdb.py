@@ -1,7 +1,7 @@
 import asyncio
 import logging
 
-from motor.motor_asyncio import AsyncIOMotorClient
+from database.mongo_clients import mongo_client
 from pyrogram import enums
 from sqlalchemy import text
 
@@ -16,7 +16,7 @@ if not USE_MONGO:
     from database.sql_store import store
 
 if USE_MONGO:
-    myclient = AsyncIOMotorClient(DATABASE_URI)
+    myclient = mongo_client(DATABASE_URI)
     mydb = myclient[DATABASE_NAME]
 
 

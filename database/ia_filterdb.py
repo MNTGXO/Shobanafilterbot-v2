@@ -9,10 +9,11 @@ import asyncio
 import time
 from pyrogram.file_id import FileId
 from pymongo.errors import DuplicateKeyError, OperationFailure
-from motor.motor_asyncio import AsyncIOMotorClient
+from database.mongo_clients import mongo_client
 import hashlib
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from database.atlas_search import AtlasCatalogSearch, MEDIA_PROJECTION
 from database.search_cache import SearchCache
 from sqlalchemy import text
 
@@ -20,6 +21,7 @@ from info import (
     DATABASE_URI, DATABASE_NAME, COLLECTION_NAME, USE_CAPTION_FILTER,
     DATABASE_URI2, DATABASE_URI3, DATABASE_URI4, DATABASE_URI5,
     DATABASE_NAME2, DATABASE_NAME3, DATABASE_NAME4, DATABASE_NAME5,
+    MONGO_INDEXED_SEARCH, MONGO_SEARCH_INDEX,
 )
 
 logger = logging.getLogger(__name__)
@@ -36,6 +38,7 @@ def _finish_search(files, next_offset, total_results, started_at, return_time):
 
 USE_MONGO = bool(DATABASE_URI)
 _rust_search = None
+_atlas_search = None
 
 
 async def close_search_worker():
@@ -151,23 +154,8 @@ def _match_filter(doc, query):
 class SQLMediaCollection:
     async def _all_docs(self):
         with store.begin() as conn:
-            rows = conn.execute(text("SELECT file_id, file_ref, file_name, file_size, file_type, mime_type, caption, created_at FROM media")).fetchall()
-        docs = []
-        for r in rows:
-            docs.append(
-                dict(
-                    file_id=r[0],
-                    _id=r[0],
-                    file_ref=r[1],
-                    file_name=r[2],
-                    file_size=r[3],
-                    file_type=r[4],
-                    mime_type=r[5],
-                    caption=r[6],
-                    created_at=r[7],
-                )
-            )
-        return docs
+            rows = conn.execute(text("SELECT file_id, file_name, file_size, file_type, mime_type, caption, created_at FROM media")).fetchall()
+        return [_sql_row_to_doc(row) for row in rows]
 
     async def find(self, query=None, projection=None):
         docs = [d for d in await self._all_docs() if _match_filter(d, query or {})]
@@ -221,13 +209,17 @@ if USE_MONGO:
             continue
         _seen.add(key)
         _shards.append(key)
-        client = AsyncIOMotorClient(key[0])
+        client = mongo_client(key[0])
         _mongo_collections.append(client[key[1]][COLLECTION_NAME])
 
     if not _mongo_collections:
         raise RuntimeError("At least one MongoDB URI is required when DATABASE_URI mode is enabled")
 
     _rust_search = RustSearchWorker(os.environ.get("RUST_SEARCH_WORKER"), _shards, COLLECTION_NAME)
+    if MONGO_INDEXED_SEARCH and not USE_CAPTION_FILTER:
+        _atlas_search = AtlasCatalogSearch(_mongo_collections, MONGO_SEARCH_INDEX)
+    elif MONGO_INDEXED_SEARCH:
+        logger.info("Indexed title search disabled because caption search is enabled")
     MONGO_SHARD_COUNT = len(_mongo_collections)
     logger.info("Media DB shards enabled: %d", MONGO_SHARD_COUNT)
 
@@ -364,13 +356,25 @@ if USE_MONGO:
 else:
     def _load_docs_sync(query=None):
         with store.begin() as conn:
-            rows = conn.execute(text("SELECT file_id, file_ref, file_name, file_size, file_type, mime_type, caption, created_at FROM media")).fetchall()
-        docs = []
-        for r in rows:
-            d = dict(file_id=r[0], _id=r[0], file_ref=r[1], file_name=r[2], file_size=r[3], file_type=r[4], mime_type=r[5], caption=r[6], created_at=r[7])
-            if _match_filter(d, query or {}):
-                docs.append(d)
-        return docs
+            rows = conn.execute(text("SELECT file_id, file_name, file_size, file_type, mime_type, caption, created_at FROM media")).fetchall()
+        docs = (_sql_row_to_doc(row) for row in rows)
+        return [doc for doc in docs if _match_filter(doc, query or {})]
+
+    def _count_sql_media(query):
+        with store.begin() as conn:
+            if not query:
+                return int(conn.execute(text("SELECT COUNT(*) FROM media")).scalar())
+
+            # Keep Python's exact regex semantics for /deletefiles previews;
+            # stream only filenames for that query instead of loading rows.
+            if query.keys() == {'file_name'}:
+                rows = conn.execution_options(yield_per=1000).execute(text("SELECT file_name FROM media"))
+                return sum(_match_filter({'file_name': row[0]}, query) for row in rows)
+
+            rows = conn.execution_options(yield_per=1000).execute(text(
+                "SELECT file_id, file_name, file_size, file_type, mime_type, caption, created_at FROM media"
+            ))
+            return sum(_match_filter(_sql_row_to_doc(row), query) for row in rows)
 
     class Media:
         collection = SQLMediaCollection()
@@ -381,7 +385,7 @@ else:
 
         @staticmethod
         async def count_documents(query=None):
-            return len(_load_docs_sync(query))
+            return await _run_sql_read(_count_sql_media, query)
 
         @staticmethod
         def find(query=None):
@@ -392,13 +396,12 @@ async def save_file(media):
     """Save file in database"""
 
     # TODO: Find better way to get same file_id for same media to avoid duplicates
-    file_id, file_ref = unpack_new_file_id(media.file_id)
+    file_id = normalize_file_id(media.file_id)
     file_name = re.sub(r"(_|\-|\.|\+)", " ", str(media.file_name))
 
     if USE_MONGO:
         doc = {
             '_id': file_id,
-            'file_ref': file_ref,
             'file_name': file_name,
             'file_size': media.file_size,
             'file_type': media.file_type,
@@ -424,12 +427,11 @@ async def save_file(media):
             return False, 0
         conn.execute(
             text(
-                "INSERT INTO media(file_id,file_ref,file_name,file_size,file_type,mime_type,caption) "
-                "VALUES (:fid,:fref,:fname,:fsize,:ftype,:mtype,:caption)"
+                "INSERT INTO media(file_id,file_name,file_size,file_type,mime_type,caption) "
+                "VALUES (:fid,:fname,:fsize,:ftype,:mtype,:caption)"
             ),
             {
                 "fid": file_id,
-                "fref": file_ref,
                 "fname": file_name,
                 "fsize": media.file_size,
                 "ftype": media.file_type,
@@ -458,39 +460,31 @@ def encode_file_id(s: bytes) -> str:
     return base64.urlsafe_b64encode(r).decode().rstrip("=")
 
 
-def encode_file_ref(file_ref: bytes) -> str:
-    return base64.urlsafe_b64encode(file_ref).decode().rstrip("=")
-
-
-def unpack_new_file_id(new_file_id):
-    """Return file_id, file_ref"""
+def normalize_file_id(new_file_id):
+    """Keep the existing catalog ID format without storing a separate reference."""
     decoded = FileId.decode(new_file_id)
-    file_id = encode_file_id(
+    return encode_file_id(
         pack(
             "<iiqq",
             int(decoded.file_type),
             decoded.dc_id,
             decoded.media_id,
-            decoded.access_hash
+            decoded.access_hash,
         )
     )
-    file_ref = encode_file_ref(decoded.file_reference)
-    return file_id, file_ref
 
-# SQL fast-path overrides
 
 def _sql_row_to_doc(row):
     return SQLMediaDoc(
         dict(
             file_id=row[0],
             _id=row[0],
-            file_ref=row[1],
-            file_name=row[2],
-            file_size=row[3],
-            file_type=row[4],
-            mime_type=row[5],
-            caption=row[6],
-            created_at=row[7],
+            file_name=row[1],
+            file_size=row[2],
+            file_type=row[3],
+            mime_type=row[4],
+            caption=row[5],
+            created_at=row[6],
         )
     )
 
@@ -572,7 +566,7 @@ def _search_sql(query, file_type, max_results, offset, fast):
         rows = conn.execute(
             text(
                 f"""
-                SELECT file_id, file_ref, file_name, file_size, file_type, mime_type, caption, created_at
+                SELECT file_id, file_name, file_size, file_type, mime_type, caption, created_at
                 FROM media
                 WHERE {where_clause}
                 ORDER BY created_at DESC
@@ -601,6 +595,12 @@ async def _load_search_results(query, file_type, max_results, offset, fast):
     if not USE_MONGO:
         return await _run_sql_read(_search_sql, query, file_type, max_results, offset, fast)
 
+    if _atlas_search is not None:
+        indexed = await _atlas_search.search(query, file_type, offset, max_results, fast)
+        if indexed is not None:
+            docs, next_offset, total_results = indexed
+            return [_as_media_doc(doc) for doc in docs], next_offset, total_results
+
     try:
         search_filter = _build_mongo_search_filter(query, file_type=file_type)
     except Exception:
@@ -611,21 +611,11 @@ async def _load_search_results(query, file_type, max_results, offset, fast):
         docs, next_offset, total_results = rust_result
         return [_as_media_doc(doc) for doc in docs], next_offset, total_results
 
-    projection = {
-        'file_ref': 1,
-        'file_name': 1,
-        'file_size': 1,
-        'file_type': 1,
-        'mime_type': 1,
-        'caption': 1,
-        'created_at': 1,
-    }
-
     if MONGO_SHARD_COUNT == 1:
         col = _mongo_collections[0]
         docs_limit = max_results + 1 if fast else max_results
         docs_task = (
-            col.find(search_filter, projection)
+            col.find(search_filter, MEDIA_PROJECTION)
             .sort('created_at', -1)
             .skip(offset)
             .limit(docs_limit)
@@ -650,7 +640,7 @@ async def _load_search_results(query, file_type, max_results, offset, fast):
 
     async def _fetch(col):
         return await (
-            col.find(search_filter, projection)
+            col.find(search_filter, MEDIA_PROJECTION)
             .sort('created_at', -1)
             .limit(fetch_limit)
             .to_list(length=fetch_limit)
@@ -686,7 +676,7 @@ def _get_file_details_sql(query):
     with store.begin() as conn:
         row = conn.execute(
             text(
-                "SELECT file_id, file_ref, file_name, file_size, file_type, mime_type, caption, created_at "
+                "SELECT file_id, file_name, file_size, file_type, mime_type, caption, created_at "
                 "FROM media WHERE file_id=:file_id LIMIT 1"
             ),
             {"file_id": query},
@@ -700,17 +690,17 @@ async def get_file_details(query):
 
     search_filter = {'_id': query}
     if MONGO_SHARD_COUNT == 1:
-        filedetails = await _mongo_collections[0].find(search_filter).limit(1).to_list(length=1)
+        filedetails = await _mongo_collections[0].find(search_filter, MEDIA_PROJECTION).limit(1).to_list(length=1)
         return [_as_media_doc(filedetails[0])] if filedetails else []
 
     primary_col = _target_collection(query)
-    filedetails = await primary_col.find(search_filter).limit(1).to_list(length=1)
+    filedetails = await primary_col.find(search_filter, MEDIA_PROJECTION).limit(1).to_list(length=1)
     if filedetails:
         return [_as_media_doc(filedetails[0])]
 
     fallback_cols = [col for col in _mongo_collections if col is not primary_col]
     fallback_results = await asyncio.gather(
-        *[col.find(search_filter).limit(1).to_list(length=1) for col in fallback_cols]
+        *[col.find(search_filter, MEDIA_PROJECTION).limit(1).to_list(length=1) for col in fallback_cols]
     )
     for filedetails in fallback_results:
         if filedetails:

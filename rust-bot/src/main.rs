@@ -96,8 +96,8 @@ async fn run_search(collections: &[Collection<Document>], search: Search) -> Res
             col.find(search_ref.filter.clone())
                 .sort(doc! { "created_at": -1 })
                 .projection(doc! {
-                    "file_ref": 1, "file_name": 1, "file_size": 1, "file_type": 1,
-                    "mime_type": 1, "caption": 1, "created_at": 1,
+                    "file_name": 1, "file_size": 1, "file_type": 1,
+                    "caption": 1, "created_at": 1,
                 })
                 .skip(if single { search_ref.offset as u64 } else { 0 })
                 .limit(fetch_limit)
